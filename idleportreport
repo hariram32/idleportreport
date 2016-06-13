@@ -1,0 +1,166 @@
+#!/usr/bin/perl
+#
+use strict;
+use warnings;
+
+use SNMP::Info;
+
+our $DEBUG = 0;
+
+# TODO: put this into a configuration file
+my $snmpHosts = {
+	DEFAULT => {
+		Version		=> '2c',
+		Community	=> '*AHEM*',
+
+#		# http://sourceforge.net/mailarchive/message.php?msg_id=20060908151858.GA1570%40warped.org
+#		BulkWalk	=> 0,
+	},
+};
+
+my $ip = shift;
+unless ( defined($ip) && $ip =~ /^\d{1,3}(\.\d{1,3}){3}$/ ) {
+  print STDERR "you need to provide a valid IP to query\n";
+  exit -1;
+}
+
+my $snmpInfo = SNMP::Info->new(
+	AutoSpecify		=> 1,
+
+	( $DEBUG == 1 ) ? ( Debug => 1, DebugSNMP => 1 ) : ( ),
+
+	DestHost		=> $ip,
+
+	( defined($snmpHosts->{$ip}) )
+		? %{$snmpHosts->{$ip}}
+		: %{$snmpHosts->{'DEFAULT'}},
+);
+
+unless ( defined($snmpInfo) ) {
+  print STDERR "There was a problem communicating with $ip...aborting\n";
+  exit 1;
+}
+if ( $snmpInfo->error ) {
+  print STDERR "There was a problem communicating with $ip (${\$snmpInfo->error})...aborting\n";
+  exit 1;
+}
+
+print "querying $ip...\n";
+my $uptime = $snmpInfo->uptime;
+print "uptime\t: " . &friendlyTime($uptime) . "\n";
+print "name\t: " . $snmpInfo->name . "\n";
+print "class\t: " . $snmpInfo->class . "\n\n";
+
+my $interfaces	= $snmpInfo->interfaces;
+my $ifInfo	= {
+	type		=> $snmpInfo->i_type,
+	name		=> $snmpInfo->i_name,
+#	alias		=> $snmpInfo->i_alias,
+#	description	=> $snmpInfo->i_description,
+	lastChanged	=> $snmpInfo->i_lastchange,
+	linkStatus	=> $snmpInfo->i_up,
+	linkStatusAdmin	=> $snmpInfo->i_up_admin,
+};
+
+#use Data::Dumper;
+#print "$uptime\n";
+#print Dumper $interfaces;
+#print Dumper $ifInfo;
+#exit 0;
+
+my $idleFound = 0;
+my $portsSummary = '';
+foreach my $if ( sort { $a <=> $b } keys %$interfaces ) {
+  next unless ( $ifInfo->{'type'}->{$if} =~ /^e10.*BaseTX$/ );
+
+  # always interested if the port is administratively down
+  if ( $ifInfo->{'linkStatusAdmin'}->{$if} eq 'down' ) {
+    $idleFound++;
+    $portsSummary .= &portSummary($uptime, $if, $interfaces, $ifInfo);
+    next;
+  }
+
+  # if the link has been down for at least 80% of the switch uptime
+  if ( $ifInfo->{'linkStatus'}->{$if} eq 'down'
+  		&& $uptime - $ifInfo->{'lastChanged'}->{$if}
+			> int(0.8*$uptime) ) {
+    $idleFound++;
+    $portsSummary .= &portSummary($uptime, $if, $interfaces, $ifInfo);
+    next;
+  }
+}
+
+if ( $idleFound > 0 ) {
+  print "int	link	admin	time	description\n$portsSummary\n";
+}
+else {
+  print "No Ports Found to Be Idle\n\n";
+}
+
+exit 0;
+
+sub portSummary {
+  my $uptime = shift;
+  my $if = shift;
+  my $interfaces = shift;
+  my $ifInfo = shift;
+
+  my $int = $interfaces->{$if};
+    $int =~ s/^FastEthernet/Fa/;
+    $int =~ s/^GigabitEthernet/Gi/;
+
+  my $time = ( $ifInfo->{'linkStatusAdmin'}->{$if} eq 'up' )
+  		? &friendlyTime($uptime - $ifInfo->{'lastChanged'}->{$if})
+		: 'n/a';
+
+  my $line = <<EOF;
+$int	$ifInfo->{'linkStatus'}->{$if}	$ifInfo->{'linkStatusAdmin'}->{$if}	$time	$ifInfo->{'name'}->{$if}
+EOF
+
+  return $line;
+}
+
+sub friendlyTime {
+  my $time = shift;
+
+  # centiseconds to units
+  my @converter = (
+	{
+		unit	=> 'w',
+		period	=> 60480000,
+	},
+	{
+		unit	=> 'd',
+		period	=> 8640000,
+	},
+	{
+		unit	=> 'h',
+		period	=> 360000,
+	},
+	{
+		unit	=> 'm',
+		period	=> 6000,
+	},
+	{
+		unit	=> 's',
+		period	=> 100,
+	}
+  );
+
+  my $friendlyTime = '';
+  my $convPos = -1;
+  for ( my $pos = 0; $pos < 3 && $convPos < scalar(@converter); $pos++ ) {
+    $convPos++;
+
+    if ( $time > $converter[$convPos]->{'period'} ) {
+      $friendlyTime .= int($time/$converter[$convPos]->{'period'})
+      				. $converter[$convPos]->{'unit'};
+      $time %= $converter[$convPos]->{'period'};
+      next;
+    }
+
+    $pos--;
+  }
+
+  return $friendlyTime;
+}
